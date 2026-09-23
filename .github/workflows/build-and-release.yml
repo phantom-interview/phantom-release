@@ -16,9 +16,9 @@ on:
         type: string
         default: ""
 
-# Needed so the built-in GITHUB_TOKEN can create/update releases in this repo.
 permissions:
   contents: write
+  actions: read
 
 concurrency:
   group: desktop-release
@@ -26,8 +26,6 @@ concurrency:
 
 env:
   PRIVATE_REPOSITORY: tapas-patra/Phantom
-  # Used only when the private repo's default branch cannot be read from the API. The real
-  # default branch is resolved at run time, so a rename upstream needs no edit here.
   PRIVATE_SOURCE_REF_FALLBACK: master
   ROLLING_TAG: desktop-latest
 
@@ -212,8 +210,212 @@ jobs:
           gh release upload "$VERSION_TAG" "$ZIP" --clobber --repo "$GITHUB_REPOSITORY"
           gh release upload "$ROLLING_TAG" "$ZIP" --clobber --repo "$GITHUB_REPOSITORY"
 
+  android-build:
+    needs: [version, prepare-release]
+    runs-on: ubuntu-latest
+    env:
+      PHANTOM_VERSION_NAME: ${{ needs.version.outputs.version }}
+      PHANTOM_VERSION_CODE: ${{ github.run_number }}
+    steps:
+      - name: Check out private source (read-only)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PRIVATE_REPOSITORY }}
+          ref: ${{ needs.version.outputs.source_ref }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          persist-credentials: false
+      - name: Refuse to build if local env files were committed
+        run: |
+          set -euo pipefail
+          # .env is gitignored repo-wide, but if one were ever force-added the Android secrets
+          # plugin reads it and bakes the values into the APK, which is attached to a public
+          # release. Fail loudly rather than publish secrets.
+          if find . -name '.env' -not -path './.git/*' | grep -q .; then
+            echo "A .env file is present in the checked-out source. Remove it before releasing." >&2
+            exit 1
+          fi
+          echo "No .env files present in the checkout."
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: wrapper
+      - name: Ensure the required Android SDK platform
+        env:
+          REQUIRED_PLATFORM: platforms;android-36.1
+        run: |
+          set -euo pipefail
+          PLATFORM="${REQUIRED_PLATFORM:-platforms;android-36.1}"
+          PLATFORM_DIR="${PLATFORM#platforms;}"
+          # Only SDK package names are printed, never source: safe for a public log.
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          echo "Android SDK root: ${SDK:-<unset>}"
+          ls "${SDK}/platforms" 2>/dev/null || echo "(no platforms directory)"
+          if [ -n "$SDK" ] && [ -d "$SDK/platforms/$PLATFORM_DIR" ]; then
+            echo "$PLATFORM already present."
+            exit 0
+          fi
+          if ! command -v sdkmanager >/dev/null 2>&1; then
+            # Not fatal: AGP can still auto-download the platform during the build.
+            echo "sdkmanager not on PATH; leaving it to AGP to fetch $PLATFORM."
+            exit 0
+          fi
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          if ! sdkmanager --install "$PLATFORM" >/dev/null 2>&1; then
+            echo "Could not install $PLATFORM. Either the package does not exist for this SDK version, or the runner cannot reach dl.google.com." >&2
+            exit 1
+          fi
+          echo "Installed $PLATFORM."
+      - name: Build unsigned Android APK
+        run: |
+          set -euo pipefail
+          LOG="$RUNNER_TEMP/android-build.log"
+          if ! ./phantom-companion-android/gradlew --no-daemon -p phantom-companion-android :app:assembleRelease \
+              "-PphantomVersionName=$PHANTOM_VERSION_NAME" \
+              "-PphantomVersionCode=$PHANTOM_VERSION_CODE" \
+              -PphantomSkipSigning=true > "$LOG" 2>&1; then
+            # Report only a fixed category, never the log itself: the log can contain private
+            # source paths because this repository is public.
+            REASON="unrecognised failure"
+            if grep -qi "licences have not been accepted" "$LOG"; then
+              REASON="an Android SDK licence is not accepted"
+            elif grep -qiE "Failed to find package|Could not find .*platform" "$LOG"; then
+              REASON="the required Android SDK platform is unavailable"
+            elif grep -qiE "keystore|Keystore was tampered|SigningConfig" "$LOG"; then
+              REASON="a signing configuration problem"
+            elif grep -qiE "Could not resolve|Could not download|Connection refused" "$LOG"; then
+              REASON="dependency resolution failed (network or repository access)"
+            elif grep -qiE "Unsupported class file major version|invalid source release" "$LOG"; then
+              REASON="JDK version mismatch"
+            fi
+            rm -f "$LOG"
+            echo "Android build failed: ${REASON}. Output suppressed: private source must not appear in public logs." >&2
+            exit 1
+          fi
+          rm -f "$LOG"
+          APK="$(find phantom-companion-android/app/build/outputs/apk/release -name '*.apk' 2>/dev/null | head -1 || true)"
+          if [ -z "$APK" ]; then
+            echo "Android build produced no APK." >&2
+            exit 1
+          fi
+          cp "$APK" "$RUNNER_TEMP/phantom-android-unsigned.apk"
+          echo "Produced unsigned APK from $(basename "$APK")."
+      - name: Upload the unsigned APK for the signing job
+        uses: actions/upload-artifact@v4
+        with:
+          name: phantom-android-unsigned
+          path: ${{ runner.temp }}/phantom-android-unsigned.apk
+          if-no-files-found: error
+          retention-days: 1
+
+  android-sign:
+    needs: [version, prepare-release, android-build]
+    runs-on: ubuntu-latest
+    environment: android-release
+    env:
+      VERSION_TAG: ${{ needs.version.outputs.tag }}
+    steps:
+      - name: Check release signing secrets
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          # Named explicitly because it is the most likely failure, and this log is public.
+          if [ -z "${KEYSTORE_B64:-}" ] || [ -z "${STORE_PASSWORD:-}" ] || [ -z "${KEY_PASSWORD:-}" ]; then
+            echo "Android signing secrets are not configured: set ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, and ANDROID_KEY_PASSWORD on the android-release environment." >&2
+            exit 1
+          fi
+      - name: Download the unsigned APK
+        uses: actions/download-artifact@v4
+        with:
+          name: phantom-android-unsigned
+          path: ${{ runner.temp }}/unsigned
+      - name: Set up JDK for apksigner
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Locate the Android SDK signing tools
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          echo "Android SDK root: ${SDK:-<unset>}"
+          find_tool() { find "$SDK/build-tools" -maxdepth 2 -name "$1" -type f 2>/dev/null | sort -V | tail -1; }
+          APKSIGNER="$(find_tool apksigner || true)"
+          ZIPALIGN="$(find_tool zipalign || true)"
+          if [ -z "$APKSIGNER" ] || [ -z "$ZIPALIGN" ]; then
+            if command -v sdkmanager >/dev/null 2>&1; then
+              yes | sdkmanager --licenses >/dev/null 2>&1 || true
+              sdkmanager --install "build-tools;36.0.0" >/dev/null 2>&1 || true
+              APKSIGNER="$(find_tool apksigner || true)"
+              ZIPALIGN="$(find_tool zipalign || true)"
+            fi
+          fi
+          if [ -z "$APKSIGNER" ] || [ -z "$ZIPALIGN" ]; then
+            echo "apksigner or zipalign not found. Install Android SDK build-tools on the runner." >&2
+            exit 1
+          fi
+          {
+            echo "APKSIGNER=$APKSIGNER"
+            echo "ZIPALIGN=$ZIPALIGN"
+          } >> "$GITHUB_ENV"
+          echo "Using $APKSIGNER"
+      - name: Sign, verify, and upload the Android APK
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          KEYSTORE="$RUNNER_TEMP/phantom-upload-key.jks"
+          printf '%s' "$KEYSTORE_B64" | base64 --decode > "$KEYSTORE"
+
+          UNSIGNED="$(find "$RUNNER_TEMP/unsigned" -name '*.apk' | head -1 || true)"
+          if [ -z "$UNSIGNED" ]; then
+            rm -f "$KEYSTORE"
+            echo "No unsigned APK was downloaded." >&2
+            exit 1
+          fi
+
+          # Alignment must be correct BEFORE signing, because re-aligning afterwards would
+          # invalidate the signature. AGP already aligns its output, so this only asserts it.
+          if ! "$ZIPALIGN" -c -P 16 -v 4 "$UNSIGNED" >/dev/null 2>&1; then
+            rm -f "$KEYSTORE"
+            echo "The unsigned APK is not 16 KB page aligned; refusing to sign it." >&2
+            exit 1
+          fi
+
+          OUT="$RUNNER_TEMP/Phantom-Android.apk"
+          # Passwords are read from the environment so they never appear in a command line.
+          if ! "$APKSIGNER" sign \
+              --ks "$KEYSTORE" \
+              --ks-key-alias "${KEY_ALIAS:-upload}" \
+              --ks-pass env:STORE_PASSWORD \
+              --key-pass env:KEY_PASSWORD \
+              --out "$OUT" "$UNSIGNED" > "$RUNNER_TEMP/sign.log" 2>&1; then
+            rm -f "$RUNNER_TEMP/sign.log" "$KEYSTORE"
+            echo "Signing failed. Check the keystore, its passwords, and ANDROID_KEY_ALIAS." >&2
+            exit 1
+          fi
+          rm -f "$RUNNER_TEMP/sign.log"
+
+          # Prints the signing certificate, which ships inside the APK anyway: not a secret.
+          "$APKSIGNER" verify --print-certs "$OUT"
+
+          rm -f "$KEYSTORE" "$UNSIGNED"
+          gh release upload "$VERSION_TAG" "$OUT" --clobber --repo "$GITHUB_REPOSITORY"
+          gh release upload "$ROLLING_TAG" "$OUT" --clobber --repo "$GITHUB_REPOSITORY"
+
   publish:
-    needs: [version, windows, macos]
+    needs: [version, windows, macos, android-sign]
     runs-on: ubuntu-latest
     env:
       VERSION: ${{ needs.version.outputs.version }}
@@ -241,3 +443,26 @@ jobs:
           gh release upload "$ROLLING_TAG" latest.json --clobber --repo "$GITHUB_REPOSITORY"
           gh release edit "$ROLLING_TAG" --notes "$NOTES" --repo "$GITHUB_REPOSITORY"
           gh release edit "$VERSION_TAG" --notes "$NOTES" --repo "$GITHUB_REPOSITORY"
+      - name: Assert releases expose only compiled build outputs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Tripwire, not prevention: every release asset is anonymously downloadable because this
+          # repository is public, so if a future change ever attaches source or a stray file, fail
+          # the run loudly. Runs last because latest.json is uploaded by the step above.
+          # Both sides are normalised with LC_ALL=C: plain `sort` collates case-insensitively under
+          # some locales, which would make the comparison order-dependent.
+          normalise() { LC_ALL=C sort | tr '\n' ' ' | sed 's/[[:space:]]*$//'; }
+          EXPECTED="$(printf '%s\n' Phantom-Android.apk Phantom-Windows-x64.zip Phantom-macOS.zip latest.json | normalise)"
+          for tag in "$ROLLING_TAG" "$VERSION_TAG"; do
+            FOUND="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
+              --json assets --jq '.assets[].name' | normalise)"
+            if [ "$FOUND" != "$EXPECTED" ]; then
+              echo "Unexpected assets on $tag." >&2
+              echo "Expected: $EXPECTED" >&2
+              echo "Found:    $FOUND" >&2
+              exit 1
+            fi
+          done
+          echo "Both releases expose exactly the expected compiled outputs."
