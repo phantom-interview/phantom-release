@@ -10,6 +10,11 @@ on:
         required: false
         type: string
         default: ""
+      source_ref:
+        description: "Branch, tag, or SHA of the private source to build. Leave empty for the private repo's default branch."
+        required: false
+        type: string
+        default: ""
 
 # Needed so the built-in GITHUB_TOKEN can create/update releases in this repo.
 permissions:
@@ -21,8 +26,9 @@ concurrency:
 
 env:
   PRIVATE_REPOSITORY: tapas-patra/Phantom
-  # Default branch of the private repo (tapas-patra/Phantom). There is no "main" branch.
-  PRIVATE_SOURCE_REF: master
+  # Used only when the private repo's default branch cannot be read from the API. The real
+  # default branch is resolved at run time, so a rename upstream needs no edit here.
+  PRIVATE_SOURCE_REF_FALLBACK: master
   ROLLING_TAG: desktop-latest
 
 jobs:
@@ -31,17 +37,43 @@ jobs:
     outputs:
       version: ${{ steps.compute.outputs.version }}
       tag: ${{ steps.compute.outputs.tag }}
+      source_ref: ${{ steps.compute.outputs.source_ref }}
       source_sha: ${{ steps.compute.outputs.source_sha }}
     steps:
-      - name: Compute desktop version
+      - name: Compute desktop version and source ref
         id: compute
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PRIVATE_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
           INPUT_MAJOR_MINOR: ${{ github.event.inputs.major_minor }}
           DISPATCH_MAJOR_MINOR: ${{ github.event.client_payload.major_minor }}
+          INPUT_SOURCE_REF: ${{ github.event.inputs.source_ref }}
+          DISPATCH_SOURCE_REF: ${{ github.event.client_payload.source_ref }}
           DISPATCH_SOURCE_SHA: ${{ github.event.client_payload.source_sha }}
         run: |
           set -euo pipefail
+          # --- which private branch/tag/SHA to build -------------------------------------
+          # Precedence: explicit workflow_dispatch input, then the dispatch payload,
+          # then the private repo's own default branch.
+          REF="$(printf '%s' "${INPUT_SOURCE_REF:-${DISPATCH_SOURCE_REF:-}}" | tr -d '[:space:]')"
+          if [ -n "$REF" ]; then
+            if printf '%s' "$REF" | grep -q '\.\.' || printf '%s' "$REF" | grep -Eq '^-'; then
+              echo "source_ref is not a valid branch, tag, or SHA." >&2
+              exit 1
+            fi
+          else
+            REF="$(GH_TOKEN="$PRIVATE_TOKEN" gh api "repos/$PRIVATE_REPOSITORY" --jq '.default_branch' 2>/dev/null || true)"
+          fi
+          REF="${REF:-$PRIVATE_SOURCE_REF_FALLBACK}"
+          # Record the commit that is actually built, so release notes and latest.json do not
+          # claim a different revision when a branch other than the trigger branch is built.
+          RESOLVED_SHA="$(GH_TOKEN="$PRIVATE_TOKEN" gh api -X GET "repos/$PRIVATE_REPOSITORY/commits" \
+            -f "sha=$REF" -f "per_page=1" --jq '.[0].sha' 2>/dev/null || true)"
+          SOURCE_SHA="${RESOLVED_SHA:-${DISPATCH_SOURCE_SHA:-$GITHUB_SHA}}"
+          echo "source_ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+          echo "Building $PRIVATE_REPOSITORY@$REF ($SOURCE_SHA)"
+          # --- version prefix and third component ----------------------------------------
           INPUT="$(printf '%s' "${INPUT_MAJOR_MINOR:-${DISPATCH_MAJOR_MINOR:-}}" | tr -d '[:space:]')"
           LAST_VERSION=""
           if [ -n "$INPUT" ]; then
@@ -83,11 +115,9 @@ jobs:
           fi
           VERSION="${PREFIX}.${THIRD}"
           TAG="v${VERSION}"
-          SOURCE_SHA="${DISPATCH_SOURCE_SHA:-$GITHUB_SHA}"
           echo "prefix=$PREFIX" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
           echo "Desktop version $VERSION (tag $TAG)"
 
   prepare-release:
@@ -96,6 +126,7 @@ jobs:
     env:
       VERSION: ${{ needs.version.outputs.version }}
       VERSION_TAG: ${{ needs.version.outputs.tag }}
+      SOURCE_REF: ${{ needs.version.outputs.source_ref }}
       SOURCE_SHA: ${{ needs.version.outputs.source_sha }}
     steps:
       - name: Ensure rolling and versioned GitHub Releases exist
@@ -103,7 +134,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          NOTES="Phantom Desktop $VERSION (unsigned) from $SOURCE_SHA."
+          NOTES="Phantom Desktop $VERSION (unsigned) from $SOURCE_REF ($SOURCE_SHA)."
           gh release view "$ROLLING_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
             gh release create "$ROLLING_TAG" --repo "$GITHUB_REPOSITORY" \
               --title "Phantom Desktop (latest)" --notes "$NOTES"
@@ -122,7 +153,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ${{ env.PRIVATE_REPOSITORY }}
-          ref: ${{ env.PRIVATE_SOURCE_REF }}
+          ref: ${{ needs.version.outputs.source_ref }}
           token: ${{ secrets.PRIVATE_REPO_TOKEN }}
           persist-credentials: false
       - name: Set up .NET
@@ -161,7 +192,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ${{ env.PRIVATE_REPOSITORY }}
-          ref: ${{ env.PRIVATE_SOURCE_REF }}
+          ref: ${{ needs.version.outputs.source_ref }}
           token: ${{ secrets.PRIVATE_REPO_TOKEN }}
           persist-credentials: false
       - name: Build, package, and upload macOS app
@@ -187,6 +218,7 @@ jobs:
     env:
       VERSION: ${{ needs.version.outputs.version }}
       VERSION_TAG: ${{ needs.version.outputs.tag }}
+      SOURCE_REF: ${{ needs.version.outputs.source_ref }}
       SOURCE_SHA: ${{ needs.version.outputs.source_sha }}
     steps:
       - name: Publish latest.json and stamp release notes
@@ -199,12 +231,13 @@ jobs:
           payload = {
             "version": os.environ["VERSION"],
             "tag": os.environ["VERSION_TAG"],
+            "ref": os.environ["SOURCE_REF"],
             "sha": os.environ["SOURCE_SHA"],
             "runNumber": int(os.environ["GITHUB_RUN_NUMBER"]),
           }
           open("latest.json", "w", encoding="utf-8").write(json.dumps(payload) + "\n")
           PY
-          NOTES="Phantom Desktop $VERSION (unsigned) from $SOURCE_SHA."
+          NOTES="Phantom Desktop $VERSION (unsigned) from $SOURCE_REF ($SOURCE_SHA)."
           gh release upload "$ROLLING_TAG" latest.json --clobber --repo "$GITHUB_REPOSITORY"
           gh release edit "$ROLLING_TAG" --notes "$NOTES" --repo "$GITHUB_REPOSITORY"
           gh release edit "$VERSION_TAG" --notes "$NOTES" --repo "$GITHUB_REPOSITORY"
