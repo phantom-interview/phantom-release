@@ -26,6 +26,8 @@ concurrency:
 
 env:
   PRIVATE_REPOSITORY: tapas-patra/Phantom
+  # Used only when the private repo's default branch cannot be read from the API. The real
+  # default branch is resolved at run time, so a rename upstream needs no edit here.
   PRIVATE_SOURCE_REF_FALLBACK: master
   ROLLING_TAG: desktop-latest
 
@@ -209,6 +211,7 @@ jobs:
           ditto -c -k --sequesterRsrc --keepParent phantom-mac-app/dist/Phantom.app "$ZIP"
           gh release upload "$VERSION_TAG" "$ZIP" --clobber --repo "$GITHUB_REPOSITORY"
           gh release upload "$ROLLING_TAG" "$ZIP" --clobber --repo "$GITHUB_REPOSITORY"
+
 
   android-build:
     needs: [version, prepare-release]
@@ -451,18 +454,32 @@ jobs:
           # Tripwire, not prevention: every release asset is anonymously downloadable because this
           # repository is public, so if a future change ever attaches source or a stray file, fail
           # the run loudly. Runs last because latest.json is uploaded by the step above.
+          # The two tags intentionally differ: the rolling tag carries latest.json (the "current
+          # release" pointer the backend and dashboard read), while the immutable vX.Y.Z release
+          # carries only the compiled outputs.
           # Both sides are normalised with LC_ALL=C: plain `sort` collates case-insensitively under
           # some locales, which would make the comparison order-dependent.
           normalise() { LC_ALL=C sort | tr '\n' ' ' | sed 's/[[:space:]]*$//'; }
-          EXPECTED="$(printf '%s\n' Phantom-Android.apk Phantom-Windows-x64.zip Phantom-macOS.zip latest.json | normalise)"
-          for tag in "$ROLLING_TAG" "$VERSION_TAG"; do
-            FOUND="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
-              --json assets --jq '.assets[].name' | normalise)"
-            if [ "$FOUND" != "$EXPECTED" ]; then
-              echo "Unexpected assets on $tag." >&2
-              echo "Expected: $EXPECTED" >&2
-              echo "Found:    $FOUND" >&2
-              exit 1
+          normalise_list() { printf '%s\n' "$@" | normalise; }
+          check_release() {
+            local tag="$1" expected="$2" found
+            # Capture explicitly so a failed API call names itself instead of exiting silently
+            # through set -e and pipefail.
+            if ! found="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
+                --json assets --jq '.assets[].name' | normalise)"; then
+              echo "Could not read the asset list for $tag. Verify the tag exists and that the workflow token can read releases." >&2
+              return 1
             fi
-          done
+            if [ "$found" != "$expected" ]; then
+              echo "Unexpected assets on $tag." >&2
+              echo "Expected: $expected" >&2
+              echo "Found:    $found" >&2
+              return 1
+            fi
+            echo "$tag exposes exactly: $found"
+          }
+          check_release "$ROLLING_TAG" \
+            "$(normalise_list Phantom-Android.apk Phantom-Windows-x64.zip Phantom-macOS.zip latest.json)"
+          check_release "$VERSION_TAG" \
+            "$(normalise_list Phantom-Android.apk Phantom-Windows-x64.zip Phantom-macOS.zip)"
           echo "Both releases expose exactly the expected compiled outputs."
