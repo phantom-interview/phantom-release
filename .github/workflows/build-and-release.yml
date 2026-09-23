@@ -1,0 +1,210 @@
+name: Build and release desktop apps
+
+on:
+  repository_dispatch:
+    types: [desktop-release]
+  workflow_dispatch:
+    inputs:
+      major_minor:
+        description: "MAJOR.MINOR only (for example 1.0 or 2.3). Leave empty to keep the last prefix."
+        required: false
+        type: string
+        default: ""
+
+# Needed so the built-in GITHUB_TOKEN can create/update releases in this repo.
+permissions:
+  contents: write
+
+concurrency:
+  group: desktop-release
+  cancel-in-progress: true
+
+env:
+  PRIVATE_REPOSITORY: tapas-patra/Phantom
+  # Default branch of the private repo (tapas-patra/Phantom). There is no "main" branch.
+  PRIVATE_SOURCE_REF: master
+  ROLLING_TAG: desktop-latest
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.compute.outputs.version }}
+      tag: ${{ steps.compute.outputs.tag }}
+      source_sha: ${{ steps.compute.outputs.source_sha }}
+    steps:
+      - name: Compute desktop version
+        id: compute
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_MAJOR_MINOR: ${{ github.event.inputs.major_minor }}
+          DISPATCH_MAJOR_MINOR: ${{ github.event.client_payload.major_minor }}
+          DISPATCH_SOURCE_SHA: ${{ github.event.client_payload.source_sha }}
+        run: |
+          set -euo pipefail
+          INPUT="$(printf '%s' "${INPUT_MAJOR_MINOR:-${DISPATCH_MAJOR_MINOR:-}}" | tr -d '[:space:]')"
+          LAST_VERSION=""
+          if [ -n "$INPUT" ]; then
+            if ! printf '%s' "$INPUT" | grep -Eq '^[0-9]+\.[0-9]+$'; then
+              echo "major_minor must be MAJOR.MINOR, for example 1.0 or 2.3" >&2
+              exit 1
+            fi
+            PREFIX="$INPUT"
+          else
+            PREFIX=""
+            WORK="$(mktemp -d)"
+            if gh release download "$ROLLING_TAG" --repo "$GITHUB_REPOSITORY" --pattern latest.json --dir "$WORK" >/dev/null 2>&1 \
+              && [ -f "$WORK/latest.json" ]; then
+              LAST="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("version",""))' "$WORK/latest.json" || true)"
+              LAST_VERSION="$LAST"
+              if printf '%s' "$LAST" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+                PREFIX="$(printf '%s' "$LAST" | awk -F. '{print $1"."$2}')"
+              fi
+            fi
+            if [ -z "$PREFIX" ]; then
+              TAGS="$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName --jq '.[].tagName' || true)"
+              CANDIDATE="$(printf '%s\n' "$TAGS" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1 | sed 's/^v//')"
+              if [ -n "$CANDIDATE" ]; then
+                PREFIX="$(printf '%s' "$CANDIDATE" | awk -F. '{print $1"."$2}')"
+              fi
+            fi
+            PREFIX="${PREFIX:-1.0}"
+          fi
+          # Third component is this public repo's run number, but never lower than the last
+          # release on the same MAJOR.MINOR. Without this guard the numbering would restart at
+          # ".1" here and look like a downgrade from the previous private-repo builds.
+          THIRD="$GITHUB_RUN_NUMBER"
+          if printf '%s' "$LAST_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            LAST_PREFIX="$(printf '%s' "$LAST_VERSION" | awk -F. '{print $1"."$2}')"
+            LAST_THIRD="$(printf '%s' "$LAST_VERSION" | awk -F. '{print $3}')"
+            if [ "$PREFIX" = "$LAST_PREFIX" ] && [ "$LAST_THIRD" -ge "$THIRD" ]; then
+              THIRD=$((LAST_THIRD + 1))
+            fi
+          fi
+          VERSION="${PREFIX}.${THIRD}"
+          TAG="v${VERSION}"
+          SOURCE_SHA="${DISPATCH_SOURCE_SHA:-$GITHUB_SHA}"
+          echo "prefix=$PREFIX" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+          echo "Desktop version $VERSION (tag $TAG)"
+
+  prepare-release:
+    needs: [version]
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      VERSION_TAG: ${{ needs.version.outputs.tag }}
+      SOURCE_SHA: ${{ needs.version.outputs.source_sha }}
+    steps:
+      - name: Ensure rolling and versioned GitHub Releases exist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          NOTES="Phantom Desktop $VERSION (unsigned) from $SOURCE_SHA."
+          gh release view "$ROLLING_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create "$ROLLING_TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "Phantom Desktop (latest)" --notes "$NOTES"
+          gh release view "$VERSION_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create "$VERSION_TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "Phantom Desktop $VERSION" --notes "$NOTES"
+
+  windows:
+    needs: [version, prepare-release]
+    runs-on: windows-latest
+    env:
+      PHANTOM_PRODUCT_VERSION: ${{ needs.version.outputs.version }}
+      VERSION_TAG: ${{ needs.version.outputs.tag }}
+    steps:
+      - name: Check out private source (read-only)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PRIVATE_REPOSITORY }}
+          ref: ${{ env.PRIVATE_SOURCE_REF }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          persist-credentials: false
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - name: Build, package, and upload Windows app
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP "windows-out"
+          $log = Join-Path $env:RUNNER_TEMP "windows-build.log"
+          dotnet publish phantom-windows-app/SecureOverlay.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true -p:PhantomProductVersion=$env:PHANTOM_PRODUCT_VERSION -p:IncludeSourceRevisionInInformationalVersion=false -o $out *> $log
+          if ($LASTEXITCODE -ne 0) {
+            Remove-Item $log -Force -ErrorAction SilentlyContinue
+            Write-Error "Windows build failed. Output suppressed: private source must not appear in public logs."
+            exit 1
+          }
+          Remove-Item $log -Force -ErrorAction SilentlyContinue
+          # Debug symbols can embed source paths; ship only the runnable output.
+          Get-ChildItem $out -Recurse -Include *.pdb -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+          $zip = Join-Path $env:RUNNER_TEMP "Phantom-Windows-x64.zip"
+          Compress-Archive -Path (Join-Path $out "*") -DestinationPath $zip -Force
+          gh release upload $env:VERSION_TAG $zip --clobber --repo "$env:GITHUB_REPOSITORY"
+          gh release upload "$env:ROLLING_TAG" $zip --clobber --repo "$env:GITHUB_REPOSITORY"
+
+  macos:
+    needs: [version, prepare-release]
+    runs-on: macos-14
+    env:
+      PHANTOM_PRODUCT_VERSION: ${{ needs.version.outputs.version }}
+      VERSION_TAG: ${{ needs.version.outputs.tag }}
+    steps:
+      - name: Check out private source (read-only)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PRIVATE_REPOSITORY }}
+          ref: ${{ env.PRIVATE_SOURCE_REF }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          persist-credentials: false
+      - name: Build, package, and upload macOS app
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          LOG="$RUNNER_TEMP/macos-build.log"
+          if ! ./phantom-mac-app/Scripts/build-app.sh > "$LOG" 2>&1; then
+            rm -f "$LOG"
+            echo "macOS build failed. Output suppressed: private source must not appear in public logs." >&2
+            exit 1
+          fi
+          rm -f "$LOG"
+          ZIP="$RUNNER_TEMP/Phantom-macOS.zip"
+          ditto -c -k --sequesterRsrc --keepParent phantom-mac-app/dist/Phantom.app "$ZIP"
+          gh release upload "$VERSION_TAG" "$ZIP" --clobber --repo "$GITHUB_REPOSITORY"
+          gh release upload "$ROLLING_TAG" "$ZIP" --clobber --repo "$GITHUB_REPOSITORY"
+
+  publish:
+    needs: [version, windows, macos]
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      VERSION_TAG: ${{ needs.version.outputs.tag }}
+      SOURCE_SHA: ${{ needs.version.outputs.source_sha }}
+    steps:
+      - name: Publish latest.json and stamp release notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os
+          payload = {
+            "version": os.environ["VERSION"],
+            "tag": os.environ["VERSION_TAG"],
+            "sha": os.environ["SOURCE_SHA"],
+            "runNumber": int(os.environ["GITHUB_RUN_NUMBER"]),
+          }
+          open("latest.json", "w", encoding="utf-8").write(json.dumps(payload) + "\n")
+          PY
+          NOTES="Phantom Desktop $VERSION (unsigned) from $SOURCE_SHA."
+          gh release upload "$ROLLING_TAG" latest.json --clobber --repo "$GITHUB_REPOSITORY"
+          gh release edit "$ROLLING_TAG" --notes "$NOTES" --repo "$GITHUB_REPOSITORY"
+          gh release edit "$VERSION_TAG" --notes "$NOTES" --repo "$GITHUB_REPOSITORY"
