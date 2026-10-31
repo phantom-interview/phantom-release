@@ -243,7 +243,7 @@ jobs:
   macos:
     needs: [version, prepare-release]
     if: ${{ needs.version.outputs.build_macos == 'true' }}
-    runs-on: macos-14
+    runs-on: macos-latest
     env:
       PHANTOM_PRODUCT_VERSION: ${{ needs.version.outputs.version }}
       VERSION_TAG: ${{ needs.version.outputs.tag }}
