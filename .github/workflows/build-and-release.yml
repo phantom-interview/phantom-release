@@ -1,10 +1,38 @@
-name: Build and release desktop apps
+name: Build and release apps
+
+# Runs in phantom-interview/phantom-release (public). The private source repo is checked out
+# read-only, built, and only compiled outputs are attached to releases. There are two channels:
+#
+#   staging -> rolling tag desktop-staging, immutable tags vX.Y.Z-staging, its own latest.json.
+#              It never touches desktop-latest, so a beta build can never become the public
+#              "latest" download.
+#   prod    -> rolling tag desktop-latest, immutable tags vX.Y.Z, and the latest.json that the
+#              backend and dashboard read. prod never moves backwards in version.
+#
+# Versioning: every run mints exactly one immutable release on its channel. The patch number is
+# derived from the newest release on that channel: same MAJOR.MINOR continues the count, a new
+# MAJOR.MINOR resets it to 0. staging and prod keep separate series (staging starts at 1.0.0).
+#
+# Partial releases: each platform uploads its own asset inside its own job, and the publish job
+# records one download pointer per platform in latest.json. A failed platform therefore does not
+# block the others: its pointer keeps the previous working build until a later run publishes it.
+# Use "Re-run failed jobs": it re-runs the failed build plus this dependent publish job, and the
+# version/tag for the run is pinned in the release-plan artifact, so a re-run reuses the same tag
+# instead of minting a new version.
 
 on:
   repository_dispatch:
     types: [desktop-release]
   workflow_dispatch:
     inputs:
+      channel:
+        description: "staging (beta; never updates desktop-latest) or prod (the public latest)."
+        required: false
+        type: choice
+        options:
+          - staging
+          - prod
+        default: staging
       major_minor:
         description: "MAJOR.MINOR only (for example 1.0 or 2.3). Leave empty to keep the last prefix."
         required: false
@@ -16,15 +44,18 @@ on:
         type: string
         default: ""
       build_windows:
-        description: "Check to build the Windows desktop app (Phantom-Windows-x64.zip). Uncheck to skip it."
+        description: "Build Phantom-Windows-x64-<version>.zip."
+        required: false
         type: boolean
         default: true
       build_macos:
-        description: "Check to build the macOS desktop app (Phantom-macOS.zip). Uncheck to skip it."
+        description: "Build Phantom-macOS-<version>.zip."
+        required: false
         type: boolean
         default: true
       build_android:
-        description: "Check to build and sign the Android APK (Phantom-Android.apk). Uncheck to skip it."
+        description: "Build and sign Phantom-Android-<version>.apk."
+        required: false
         type: boolean
         default: true
 
@@ -32,34 +63,54 @@ permissions:
   contents: write
   actions: read
 
+# One run at a time per channel. Publishing rewrites release assets and latest.json, so two
+# concurrent runs in the same channel would race on them (read-modify-write of latest.json).
+# staging and prod use different groups: a beta build never waits behind, or cancels, a
+# production release. cancel-in-progress stays false because cancelling mid-publish can leave a
+# half-updated pointer set.
 concurrency:
-  group: desktop-release
-  cancel-in-progress: true
+  group: desktop-release-${{ github.event.inputs.channel || github.event.client_payload.channel || 'staging' }}
+  cancel-in-progress: false
 
 env:
   PRIVATE_REPOSITORY: tapas-patra/Phantom
   # Used only when the private repo's default branch cannot be read from the API. The real
   # default branch is resolved at run time, so a rename upstream needs no edit here.
   PRIVATE_SOURCE_REF_FALLBACK: master
-  ROLLING_TAG: desktop-latest
 
 jobs:
+  # ---------------------------------------------------------------------------------------------
+  # Plan: resolve channel, platforms, source revision, and the version this run owns.
+  # ---------------------------------------------------------------------------------------------
   version:
+    name: Plan release
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.compute.outputs.version }}
-      tag: ${{ steps.compute.outputs.tag }}
-      source_ref: ${{ steps.compute.outputs.source_ref }}
-      source_sha: ${{ steps.compute.outputs.source_sha }}
-      build_windows: ${{ steps.compute.outputs.build_windows }}
-      build_macos: ${{ steps.compute.outputs.build_macos }}
-      build_android: ${{ steps.compute.outputs.build_android }}
+      channel: ${{ steps.plan.outputs.channel }}
+      rolling_tag: ${{ steps.plan.outputs.rolling_tag }}
+      version: ${{ steps.plan.outputs.version }}
+      tag: ${{ steps.plan.outputs.tag }}
+      source_ref: ${{ steps.plan.outputs.source_ref }}
+      source_sha: ${{ steps.plan.outputs.source_sha }}
+      build_windows: ${{ steps.plan.outputs.build_windows }}
+      build_macos: ${{ steps.plan.outputs.build_macos }}
+      build_android: ${{ steps.plan.outputs.build_android }}
     steps:
-      - name: Compute desktop version, source ref, and target platforms
-        id: compute
+      - name: Look for a plan pinned by an earlier attempt of this run
+        id: existing
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: release-plan
+          path: ${{ runner.temp }}/existing-plan
+
+      - name: Compute the release plan
+        id: plan
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PRIVATE_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          INPUT_CHANNEL: ${{ github.event.inputs.channel }}
+          DISPATCH_CHANNEL: ${{ github.event.client_payload.channel }}
           INPUT_MAJOR_MINOR: ${{ github.event.inputs.major_minor }}
           DISPATCH_MAJOR_MINOR: ${{ github.event.client_payload.major_minor }}
           INPUT_SOURCE_REF: ${{ github.event.inputs.source_ref }}
@@ -73,11 +124,24 @@ jobs:
           DISPATCH_BUILD_ANDROID: ${{ github.event.client_payload.build_android }}
         run: |
           set -euo pipefail
-          # --- which platforms to build ---------------------------------------------------
-          # GitHub workflow_dispatch has no multi-select input, so each platform is its own
-          # boolean checkbox and any combination can be selected. A value that is absent (a
-          # repository_dispatch caller that does not know these keys) means "build it", which
-          # keeps existing dispatchers behaving exactly as before.
+
+          # --- channel ---------------------------------------------------------------------
+          # Absent means staging: a dispatch caller that does not know about channels keeps
+          # building beta artifacts and can never move the public latest pointer.
+          CHANNEL_IN="$(printf '%s' "${INPUT_CHANNEL:-${DISPATCH_CHANNEL:-}}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+          case "$CHANNEL_IN" in
+            ''|staging|beta) CHANNEL=staging ;;
+            prod|production|stable) CHANNEL=prod ;;
+            *) echo "channel must be staging or prod, got '${CHANNEL_IN}'." >&2; exit 1 ;;
+          esac
+          case "$CHANNEL" in
+            staging) ROLLING_TAG=desktop-staging; TAG_SUFFIX="-staging" ;;
+            prod)    ROLLING_TAG=desktop-latest;  TAG_SUFFIX="" ;;
+          esac
+
+          # --- which platforms to build ----------------------------------------------------
+          # Each platform is its own boolean so any combination can be selected. A value that is
+          # absent (a repository_dispatch caller that does not know these keys) means "build it".
           read_bool() {
             local label="$1" raw
             raw="$(printf '%s' "${2:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
@@ -92,27 +156,17 @@ jobs:
           BUILD_MACOS="$(read_bool build_macos "${INPUT_BUILD_MACOS:-${DISPATCH_BUILD_MACOS:-}}")"
           BUILD_ANDROID="$(read_bool build_android "${INPUT_BUILD_ANDROID:-${DISPATCH_BUILD_ANDROID:-}}")"
 
-          if [ "$BUILD_WINDOWS" != "true" ] && [ "$BUILD_MACOS" != "true" ] && [ "$BUILD_ANDROID" != "true" ]; then
+          SELECTED=""
+          if [ "$BUILD_WINDOWS" = "true" ]; then SELECTED="${SELECTED:+$SELECTED,}windows"; fi
+          if [ "$BUILD_MACOS" = "true" ]; then SELECTED="${SELECTED:+$SELECTED,}macos"; fi
+          if [ "$BUILD_ANDROID" = "true" ]; then SELECTED="${SELECTED:+$SELECTED,}android"; fi
+          if [ -z "$SELECTED" ]; then
             echo "Nothing to build: enable at least one of build_windows, build_macos, or build_android." >&2
             exit 1
           fi
+          echo "Platforms: $SELECTED"
 
-          echo "build_windows=$BUILD_WINDOWS" >> "$GITHUB_OUTPUT"
-          echo "build_macos=$BUILD_MACOS" >> "$GITHUB_OUTPUT"
-          echo "build_android=$BUILD_ANDROID" >> "$GITHUB_OUTPUT"
-          echo "Platforms: windows=$BUILD_WINDOWS macos=$BUILD_MACOS android=$BUILD_ANDROID"
-          {
-            echo "### Desktop release plan"
-            echo ""
-            echo "| Platform | Build |"
-            echo "| --- | --- |"
-            echo "| Windows | $BUILD_WINDOWS |"
-            echo "| macOS | $BUILD_MACOS |"
-            echo "| Android | $BUILD_ANDROID |"
-          } >> "$GITHUB_STEP_SUMMARY"
-          # --- which private branch/tag/SHA to build -------------------------------------
-          # Precedence: explicit workflow_dispatch input, then the dispatch payload,
-          # then the private repo's own default branch.
+          # --- which private branch/tag/SHA to build --------------------------------------
           REF="$(printf '%s' "${INPUT_SOURCE_REF:-${DISPATCH_SOURCE_REF:-}}" | tr -d '[:space:]')"
           if [ -n "$REF" ]; then
             if printf '%s' "$REF" | grep -q '\.\.' || printf '%s' "$REF" | grep -Eq '^-'; then
@@ -128,101 +182,265 @@ jobs:
           RESOLVED_SHA="$(GH_TOKEN="$PRIVATE_TOKEN" gh api -X GET "repos/$PRIVATE_REPOSITORY/commits" \
             -f "sha=$REF" -f "per_page=1" --jq '.[0].sha' 2>/dev/null || true)"
           SOURCE_SHA="${RESOLVED_SHA:-${DISPATCH_SOURCE_SHA:-$GITHUB_SHA}}"
-          echo "source_ref=$REF" >> "$GITHUB_OUTPUT"
-          echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
-          echo "Building $PRIVATE_REPOSITORY@$REF ($SOURCE_SHA)"
-          # --- version prefix and third component ----------------------------------------
-          INPUT="$(printf '%s' "${INPUT_MAJOR_MINOR:-${DISPATCH_MAJOR_MINOR:-}}" | tr -d '[:space:]')"
-          LAST_VERSION=""
-          if [ -n "$INPUT" ]; then
-            if ! printf '%s' "$INPUT" | grep -Eq '^[0-9]+\.[0-9]+$'; then
+
+          PLAN_DIR="$RUNNER_TEMP/plan-out"
+          mkdir -p "$PLAN_DIR"
+          PLAN="$PLAN_DIR/release-plan.json"
+          EXISTING_PLAN="$RUNNER_TEMP/existing-plan/release-plan.json"
+
+          if [ -f "$EXISTING_PLAN" ]; then
+            # A re-run of this same run (run id is stable across attempts). Reuse the pinned
+            # plan so the rebuild lands on the same tag instead of minting a new version.
+            cp "$EXISTING_PLAN" "$PLAN"
+            echo "Reusing the release plan pinned by an earlier attempt of run $GITHUB_RUN_ID."
+          else
+            INPUT_MM="$(printf '%s' "${INPUT_MAJOR_MINOR:-${DISPATCH_MAJOR_MINOR:-}}" | tr -d '[:space:]')"
+            if [ -n "$INPUT_MM" ] && ! printf '%s' "$INPUT_MM" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'; then
               echo "major_minor must be MAJOR.MINOR, for example 1.0 or 2.3" >&2
               exit 1
             fi
-            PREFIX="$INPUT"
-          else
-            PREFIX=""
-            WORK="$(mktemp -d)"
-            if gh release download "$ROLLING_TAG" --repo "$GITHUB_REPOSITORY" --pattern latest.json --dir "$WORK" >/dev/null 2>&1 \
-              && [ -f "$WORK/latest.json" ]; then
-              LAST="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("version",""))' "$WORK/latest.json" || true)"
-              LAST_VERSION="$LAST"
-              if printf '%s' "$LAST" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-                PREFIX="$(printf '%s' "$LAST" | awk -F. '{print $1"."$2}')"
-              fi
-            fi
-            if [ -z "$PREFIX" ]; then
-              TAGS="$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName --jq '.[].tagName' || true)"
-              CANDIDATE="$(printf '%s\n' "$TAGS" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1 | sed 's/^v//')"
-              if [ -n "$CANDIDATE" ]; then
-                PREFIX="$(printf '%s' "$CANDIDATE" | awk -F. '{print $1"."$2}')"
-              fi
-            fi
-            PREFIX="${PREFIX:-1.0}"
-          fi
-          # Third component is this public repo's run number, but never lower than the last
-          # release on the same MAJOR.MINOR. Without this guard the numbering would restart at
-          # ".1" here and look like a downgrade from the previous private-repo builds.
-          THIRD="$GITHUB_RUN_NUMBER"
-          if printf '%s' "$LAST_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-            LAST_PREFIX="$(printf '%s' "$LAST_VERSION" | awk -F. '{print $1"."$2}')"
-            LAST_THIRD="$(printf '%s' "$LAST_VERSION" | awk -F. '{print $3}')"
-            if [ "$PREFIX" = "$LAST_PREFIX" ] && [ "$LAST_THIRD" -ge "$THIRD" ]; then
-              THIRD=$((LAST_THIRD + 1))
-            fi
-          fi
-          VERSION="${PREFIX}.${THIRD}"
-          TAG="v${VERSION}"
-          echo "prefix=$PREFIX" >> "$GITHUB_OUTPUT"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "Desktop version $VERSION (tag $TAG)"
 
-  prepare-release:
-    needs: [version]
-    runs-on: ubuntu-latest
-    env:
-      VERSION: ${{ needs.version.outputs.version }}
-      VERSION_TAG: ${{ needs.version.outputs.tag }}
-      SOURCE_REF: ${{ needs.version.outputs.source_ref }}
-      SOURCE_SHA: ${{ needs.version.outputs.source_sha }}
-    steps:
-      - name: Ensure rolling and versioned GitHub Releases exist
+            # Every immutable release on the channel is one build; the newest one is the
+            # baseline for the next patch number and the guard against prod downgrades.
+            if [ "$CHANNEL" = "staging" ]; then
+              CHANNEL_RE='^v[0-9]+\.[0-9]+\.[0-9]+-staging$'
+            else
+              CHANNEL_RE='^v[0-9]+\.[0-9]+\.[0-9]+$'
+            fi
+            RELEASES="$(gh release list --repo "$GITHUB_REPOSITORY" --limit 300 --json tagName,createdAt \
+              --jq '.[] | [.createdAt, .tagName] | @tsv' | LC_ALL=C sort -r)"
+            CHANNEL_TAGS="$(printf '%s\n' "$RELEASES" | cut -f2 | grep -E "$CHANNEL_RE" || true)"
+            LAST_TAG="$(printf '%s\n' "$CHANNEL_TAGS" | head -1)"
+            LAST_VERSION=""
+            if [ -n "$LAST_TAG" ]; then
+              LAST_VERSION="$(printf '%s' "$LAST_TAG" | sed -e 's/^v//' -e 's/-staging$//')"
+            fi
+            MAX_VERSION="$(printf '%s\n' "$CHANNEL_TAGS" | sed -e 's/^v//' -e 's/-staging$//' \
+              | sed '/^$/d' | LC_ALL=C sort -V | tail -1)"
+
+            LAST_MAJOR=0; LAST_MINOR=0; LAST_PATCH=0
+            if [ -n "$LAST_VERSION" ]; then
+              LAST_MAJOR="${LAST_VERSION%%.*}"
+              REST="${LAST_VERSION#*.}"
+              LAST_MINOR="${REST%%.*}"
+              LAST_PATCH="${REST#*.}"
+            fi
+
+            if [ -n "$INPUT_MM" ]; then
+              PREFIX="$INPUT_MM"
+            elif [ -n "$LAST_VERSION" ]; then
+              PREFIX="${LAST_MAJOR}.${LAST_MINOR}"
+            else
+              # Fresh channel: staging starts at 1.0.0. prod with no releases at all also starts
+              # at 1.0.0; when old (pre-channel) tags exist they are picked up above instead.
+              PREFIX="1.0"
+            fi
+            PREFIX_MAJOR="${PREFIX%%.*}"
+            PREFIX_MINOR="${PREFIX#*.}"
+
+            if [ "$CHANNEL" = "prod" ] && [ -n "$MAX_VERSION" ]; then
+              MAX_PREFIX="${MAX_VERSION%.*}"
+              MAX_MAJOR="${MAX_PREFIX%%.*}"
+              MAX_MINOR="${MAX_PREFIX#*.}"
+              if [ "$PREFIX_MAJOR" -lt "$MAX_MAJOR" ] || \
+                 { [ "$PREFIX_MAJOR" -eq "$MAX_MAJOR" ] && [ "$PREFIX_MINOR" -lt "$MAX_MINOR" ]; }; then
+                echo "prod does not allow downgrades: $PREFIX is behind the current prod line $MAX_PREFIX (highest release $MAX_VERSION). Pick a higher MAJOR.MINOR." >&2
+                exit 1
+              fi
+            fi
+
+            # Same MAJOR.MINOR continues the count; a new MAJOR.MINOR starts at 0. leaving the
+            # prefix empty therefore keeps counting, and passing a new prefix resets it.
+            PATCH=0
+            if [ -n "$LAST_VERSION" ] && [ "$PREFIX" = "${LAST_MAJOR}.${LAST_MINOR}" ]; then
+              PATCH=$((LAST_PATCH + 1))
+            fi
+
+            # Tags are immutable, so skip over any version that already exists (for example
+            # when a previous run created its release but never published assets).
+            CANDIDATE_TAG=""
+            for _ in $(seq 1 500); do
+              CANDIDATE="${PREFIX}.${PATCH}${TAG_SUFFIX}"
+              CANDIDATE_TAG="v${CANDIDATE}"
+              if ! gh release view "$CANDIDATE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+                break
+              fi
+              CANDIDATE_TAG=""
+              PATCH=$((PATCH + 1))
+            done
+            if [ -z "$CANDIDATE_TAG" ]; then
+              echo "Could not find a free version tag for ${PREFIX} on the ${CHANNEL} channel." >&2
+              exit 1
+            fi
+
+            export PLAN_CHANNEL="$CHANNEL"
+            export PLAN_ROLLING="$ROLLING_TAG"
+            export PLAN_VERSION="${PREFIX}.${PATCH}${TAG_SUFFIX}"
+            export PLAN_TAG="$CANDIDATE_TAG"
+            export PLAN_REF="$REF"
+            export PLAN_SHA="$SOURCE_SHA"
+            export PLAN_PLATFORMS="$SELECTED"
+            export PLAN_RUN_ID="$GITHUB_RUN_ID"
+            export PLAN_RUN_NUMBER="$GITHUB_RUN_NUMBER"
+            export PLAN_RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+
+          python3 - "$PLAN" <<'PY'
+          import json
+          import os
+          import sys
+
+          plan = {
+              "channel": os.environ["PLAN_CHANNEL"],
+              "rollingTag": os.environ["PLAN_ROLLING"],
+              "version": os.environ["PLAN_VERSION"],
+              "tag": os.environ["PLAN_TAG"],
+              "sourceRef": os.environ["PLAN_REF"],
+              "sourceSha": os.environ["PLAN_SHA"],
+              "platforms": [p for p in os.environ["PLAN_PLATFORMS"].split(",") if p],
+              "runId": int(os.environ["PLAN_RUN_ID"]),
+              "runNumber": int(os.environ["PLAN_RUN_NUMBER"]),
+              # Android needs an integer that only ever grows across BOTH channels. The
+              # workflow run number is shared by staging and prod and never repeats, so it
+              # stays monotonic without a second ledger to race on.
+              "versionCode": int(os.environ["PLAN_RUN_NUMBER"]),
+              "runUrl": os.environ["PLAN_RUN_URL"],
+          }
+          with open(sys.argv[1], "w", encoding="utf-8", newline="\n") as handle:
+              handle.write(json.dumps(plan, indent=2) + "\n")
+          PY
+          fi
+
+          {
+            echo "channel=$(jq -r .channel "$PLAN")"
+            echo "rolling_tag=$(jq -r .rollingTag "$PLAN")"
+            echo "version=$(jq -r .version "$PLAN")"
+            echo "tag=$(jq -r .tag "$PLAN")"
+            echo "source_ref=$(jq -r .sourceRef "$PLAN")"
+            echo "source_sha=$(jq -r .sourceSha "$PLAN")"
+            echo "build_windows=$(jq -r '.platforms | index("windows") != null' "$PLAN")"
+            echo "build_macos=$(jq -r '.platforms | index("macos") != null' "$PLAN")"
+            echo "build_android=$(jq -r '.platforms | index("android") != null' "$PLAN")"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Desktop release plan"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Channel | $(jq -r .channel "$PLAN") |"
+            echo "| Version | $(jq -r .version "$PLAN") |"
+            echo "| Tag | $(jq -r .tag "$PLAN") |"
+            echo "| Rolling tag | $(jq -r .rollingTag "$PLAN") |"
+            echo "| Platforms | $(jq -r '.platforms | join(", ")' "$PLAN") |"
+            echo "| Source | $(jq -r .sourceRef "$PLAN") ($(jq -r .sourceSha "$PLAN")) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Pin the plan for re-runs
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-plan
+          path: ${{ runner.temp }}/plan-out/release-plan.json
+          if-no-files-found: error
+          retention-days: 30
+          # A "Re-run all jobs" re-executes this job and must replace the pinned copy, not fail
+          # on a name collision with the previous attempt.
+          overwrite: true
+
+      - name: Ensure the rolling and versioned releases exist
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CHANNEL: ${{ steps.plan.outputs.channel }}
+          ROLLING_TAG: ${{ steps.plan.outputs.rolling_tag }}
+          VERSION: ${{ steps.plan.outputs.version }}
+          TAG: ${{ steps.plan.outputs.tag }}
+          SOURCE_REF: ${{ steps.plan.outputs.source_ref }}
+          SOURCE_SHA: ${{ steps.plan.outputs.source_sha }}
         run: |
           set -euo pipefail
-          NOTES="Phantom Desktop $VERSION (unsigned) from $SOURCE_REF ($SOURCE_SHA)."
-          gh release view "$ROLLING_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
-            gh release create "$ROLLING_TAG" --repo "$GITHUB_REPOSITORY" \
-              --title "Phantom Desktop (latest)" --notes "$NOTES"
-          gh release view "$VERSION_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
-            gh release create "$VERSION_TAG" --repo "$GITHUB_REPOSITORY" \
-              --title "Phantom Desktop $VERSION" --notes "$NOTES"
+          PRERELEASE=""
+          if [ "$CHANNEL" = "staging" ]; then PRERELEASE="--prerelease"; fi
 
+          ROLLING_TITLE="Phantom Desktop (latest)"
+          if [ "$CHANNEL" = "staging" ]; then ROLLING_TITLE="Phantom Desktop (staging)"; fi
+          if ! gh release view "$ROLLING_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$ROLLING_TAG" --repo "$GITHUB_REPOSITORY" --title "$ROLLING_TITLE" \
+              --notes "Download pointers for the $CHANNEL channel. latest.json is the machine-readable source of truth." $PRERELEASE
+          fi
+
+          # The immutable release is created before any build so every job has a stable upload
+          # target even when another platform fails. publish replaces the notes at the end.
+          BODY="$(printf 'Phantom Desktop %s (unsigned) from %s (%s).\n\nchannel: %s\nversion: %s\nrun: %s\nref: %s\nsha: %s\nplatforms: %s\n' \
+            "$VERSION" "$SOURCE_REF" "$SOURCE_SHA" "$CHANNEL" "$VERSION" "$GITHUB_RUN_ID" "$SOURCE_REF" "$SOURCE_SHA" \
+            "$(jq -r '.platforms | join(",")' "$RUNNER_TEMP/plan-out/release-plan.json")")"
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "Phantom Desktop $VERSION" \
+              --notes "$BODY" $PRERELEASE
+          fi
+          echo "Releases ready: $ROLLING_TAG and $TAG ($CHANNEL channel)."
+
+  # ---------------------------------------------------------------------------------------------
+  # Builds. Each job owns exactly one asset and uploads it to both its versioned tag and the
+  # channel's rolling tag as soon as it succeeds; nothing here waits for a sibling platform.
+  # ---------------------------------------------------------------------------------------------
   windows:
-    needs: [version, prepare-release]
-    if: ${{ needs.version.outputs.build_windows == 'true' }}
+    name: Windows
+    needs: [version]
+    # A cleared checkbox leaves Windows out of the plan and skips every build step. `!= 'false'`
+    # also keeps the job eligible when a re-run of only the failed jobs leaves needs outputs
+    # empty; the pinned plan still makes the final decision.
+    if: ${{ needs.version.outputs.build_windows != 'false' }}
     runs-on: windows-latest
-    env:
-      PHANTOM_PRODUCT_VERSION: ${{ needs.version.outputs.version }}
-      VERSION_TAG: ${{ needs.version.outputs.tag }}
     steps:
+      - name: Download the release plan
+        uses: actions/download-artifact@v4
+        with:
+          name: release-plan
+          path: ${{ runner.temp }}/release-plan
+
+      - name: Read the release plan
+        id: plan
+        shell: pwsh
+        run: |
+          $planPath = Join-Path $env:RUNNER_TEMP "release-plan/release-plan.json"
+          if (-not (Test-Path $planPath)) {
+            Write-Error "The release plan artifact is missing; the version job did not finish."
+            exit 1
+          }
+          $plan = Get-Content $planPath -Raw | ConvertFrom-Json
+          $enabled = (@($plan.platforms) -contains "windows")
+          @(
+            "enabled=$($enabled.ToString().ToLowerInvariant())"
+            "version=$($plan.version)"
+            "tag=$($plan.tag)"
+            "rolling_tag=$($plan.rollingTag)"
+            "source_ref=$($plan.sourceRef)"
+            "source_sha=$($plan.sourceSha)"
+          ) | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
       - name: Check out private source (read-only)
+        if: steps.plan.outputs.enabled == 'true'
         uses: actions/checkout@v4
         with:
           repository: ${{ env.PRIVATE_REPOSITORY }}
-          ref: ${{ needs.version.outputs.source_ref }}
+          ref: ${{ steps.plan.outputs.source_ref }}
           token: ${{ secrets.PRIVATE_REPO_TOKEN }}
           persist-credentials: false
+
       - name: Set up .NET
+        if: steps.plan.outputs.enabled == 'true'
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "8.0.x"
+
       - name: Build, package, and upload Windows app
+        if: steps.plan.outputs.enabled == 'true'
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PHANTOM_PRODUCT_VERSION: ${{ steps.plan.outputs.version }}
+          VERSION_TAG: ${{ steps.plan.outputs.tag }}
+          ROLLING_TAG: ${{ steps.plan.outputs.rolling_tag }}
+          ASSET_NAME: Phantom-Windows-x64-${{ steps.plan.outputs.version }}.zip
         run: |
           $out = Join-Path $env:RUNNER_TEMP "windows-out"
           $log = Join-Path $env:RUNNER_TEMP "windows-build.log"
@@ -235,29 +453,56 @@ jobs:
           Remove-Item $log -Force -ErrorAction SilentlyContinue
           # Debug symbols can embed source paths; ship only the runnable output.
           Get-ChildItem $out -Recurse -Include *.pdb -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
-          $zip = Join-Path $env:RUNNER_TEMP "Phantom-Windows-x64.zip"
+          $zip = Join-Path $env:RUNNER_TEMP $env:ASSET_NAME
           Compress-Archive -Path (Join-Path $out "*") -DestinationPath $zip -Force
           gh release upload $env:VERSION_TAG $zip --clobber --repo "$env:GITHUB_REPOSITORY"
-          gh release upload "$env:ROLLING_TAG" $zip --clobber --repo "$env:GITHUB_REPOSITORY"
+          gh release upload $env:ROLLING_TAG $zip --clobber --repo "$env:GITHUB_REPOSITORY"
 
   macos:
-    needs: [version, prepare-release]
-    if: ${{ needs.version.outputs.build_macos == 'true' }}
+    name: macOS
+    needs: [version]
+    if: ${{ needs.version.outputs.build_macos != 'false' }}
     runs-on: macos-latest
-    env:
-      PHANTOM_PRODUCT_VERSION: ${{ needs.version.outputs.version }}
-      VERSION_TAG: ${{ needs.version.outputs.tag }}
     steps:
+      - name: Download the release plan
+        uses: actions/download-artifact@v4
+        with:
+          name: release-plan
+          path: ${{ runner.temp }}/release-plan
+
+      - name: Read the release plan
+        id: plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          PLAN="$RUNNER_TEMP/release-plan/release-plan.json"
+          test -f "$PLAN" || { echo "The release plan artifact is missing; the version job did not finish." >&2; exit 1; }
+          {
+            echo "enabled=$(jq -r '.platforms | index("macos") != null' "$PLAN")"
+            echo "version=$(jq -r .version "$PLAN")"
+            echo "tag=$(jq -r .tag "$PLAN")"
+            echo "rolling_tag=$(jq -r .rollingTag "$PLAN")"
+            echo "source_ref=$(jq -r .sourceRef "$PLAN")"
+            echo "source_sha=$(jq -r .sourceSha "$PLAN")"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Check out private source (read-only)
+        if: steps.plan.outputs.enabled == 'true'
         uses: actions/checkout@v4
         with:
           repository: ${{ env.PRIVATE_REPOSITORY }}
-          ref: ${{ needs.version.outputs.source_ref }}
+          ref: ${{ steps.plan.outputs.source_ref }}
           token: ${{ secrets.PRIVATE_REPO_TOKEN }}
           persist-credentials: false
+
       - name: Build, package, and upload macOS app
+        if: steps.plan.outputs.enabled == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PHANTOM_PRODUCT_VERSION: ${{ steps.plan.outputs.version }}
+          VERSION_TAG: ${{ steps.plan.outputs.tag }}
+          ROLLING_TAG: ${{ steps.plan.outputs.rolling_tag }}
+          ASSET_NAME: Phantom-macOS-${{ steps.plan.outputs.version }}.zip
         run: |
           set -euo pipefail
           LOG="$RUNNER_TEMP/macos-build.log"
@@ -267,27 +512,51 @@ jobs:
             exit 1
           fi
           rm -f "$LOG"
-          ZIP="$RUNNER_TEMP/Phantom-macOS.zip"
+          ZIP="$RUNNER_TEMP/$ASSET_NAME"
           ditto -c -k --sequesterRsrc --keepParent phantom-mac-app/dist/Phantom.app "$ZIP"
           gh release upload "$VERSION_TAG" "$ZIP" --clobber --repo "$GITHUB_REPOSITORY"
           gh release upload "$ROLLING_TAG" "$ZIP" --clobber --repo "$GITHUB_REPOSITORY"
 
   android-build:
-    needs: [version, prepare-release]
-    if: ${{ needs.version.outputs.build_android == 'true' }}
+    name: Android build
+    needs: [version]
+    if: ${{ needs.version.outputs.build_android != 'false' }}
     runs-on: ubuntu-latest
-    env:
-      PHANTOM_VERSION_NAME: ${{ needs.version.outputs.version }}
-      PHANTOM_VERSION_CODE: ${{ github.run_number }}
     steps:
+      - name: Download the release plan
+        uses: actions/download-artifact@v4
+        with:
+          name: release-plan
+          path: ${{ runner.temp }}/release-plan
+
+      - name: Read the release plan
+        id: plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          PLAN="$RUNNER_TEMP/release-plan/release-plan.json"
+          test -f "$PLAN" || { echo "The release plan artifact is missing; the version job did not finish." >&2; exit 1; }
+          {
+            echo "enabled=$(jq -r '.platforms | index("android") != null' "$PLAN")"
+            echo "version=$(jq -r .version "$PLAN")"
+            echo "tag=$(jq -r .tag "$PLAN")"
+            echo "rolling_tag=$(jq -r .rollingTag "$PLAN")"
+            echo "source_ref=$(jq -r .sourceRef "$PLAN")"
+            echo "source_sha=$(jq -r .sourceSha "$PLAN")"
+            echo "version_code=$(jq -r .versionCode "$PLAN")"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Check out private source (read-only)
+        if: steps.plan.outputs.enabled == 'true'
         uses: actions/checkout@v4
         with:
           repository: ${{ env.PRIVATE_REPOSITORY }}
-          ref: ${{ needs.version.outputs.source_ref }}
+          ref: ${{ steps.plan.outputs.source_ref }}
           token: ${{ secrets.PRIVATE_REPO_TOKEN }}
           persist-credentials: false
+
       - name: Refuse to build if local env files were committed
+        if: steps.plan.outputs.enabled == 'true'
         run: |
           set -euo pipefail
           # .env is gitignored repo-wide, but if one were ever force-added the Android secrets
@@ -298,16 +567,22 @@ jobs:
             exit 1
           fi
           echo "No .env files present in the checkout."
+
       - name: Set up JDK
+        if: steps.plan.outputs.enabled == 'true'
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "21"
+
       - name: Set up Gradle
+        if: steps.plan.outputs.enabled == 'true'
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: wrapper
+
       - name: Ensure the required Android SDK platform
+        if: steps.plan.outputs.enabled == 'true'
         env:
           REQUIRED_PLATFORM: platforms;android-36.1
         run: |
@@ -333,7 +608,12 @@ jobs:
             exit 1
           fi
           echo "Installed $PLATFORM."
+
       - name: Build unsigned Android APK
+        if: steps.plan.outputs.enabled == 'true'
+        env:
+          PHANTOM_VERSION_NAME: ${{ steps.plan.outputs.version }}
+          PHANTOM_VERSION_CODE: ${{ steps.plan.outputs.version_code }}
         run: |
           set -euo pipefail
           LOG="$RUNNER_TEMP/android-build.log"
@@ -367,23 +647,49 @@ jobs:
           fi
           cp "$APK" "$RUNNER_TEMP/phantom-android-unsigned.apk"
           echo "Produced unsigned APK from $(basename "$APK")."
+
       - name: Upload the unsigned APK for the signing job
+        if: steps.plan.outputs.enabled == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: phantom-android-unsigned
           path: ${{ runner.temp }}/phantom-android-unsigned.apk
           if-no-files-found: error
           retention-days: 1
+          # Needed when a re-run rebuilds this job inside the same workflow run.
+          overwrite: true
 
   android-sign:
-    needs: [version, prepare-release, android-build]
-    if: ${{ needs.version.outputs.build_android == 'true' }}
+    name: Android sign
+    needs: [version, android-build]
+    if: ${{ needs.version.outputs.build_android != 'false' }}
     runs-on: ubuntu-latest
+    # The signing key stays behind the protected environment in both channels: signing is the
+    # risky step regardless of whether the artifact is beta or production.
     environment: android-release
-    env:
-      VERSION_TAG: ${{ needs.version.outputs.tag }}
     steps:
+      - name: Download the release plan
+        uses: actions/download-artifact@v4
+        with:
+          name: release-plan
+          path: ${{ runner.temp }}/release-plan
+
+      - name: Read the release plan
+        id: plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          PLAN="$RUNNER_TEMP/release-plan/release-plan.json"
+          test -f "$PLAN" || { echo "The release plan artifact is missing; the version job did not finish." >&2; exit 1; }
+          {
+            echo "enabled=$(jq -r '.platforms | index("android") != null' "$PLAN")"
+            echo "version=$(jq -r .version "$PLAN")"
+            echo "tag=$(jq -r .tag "$PLAN")"
+            echo "rolling_tag=$(jq -r .rollingTag "$PLAN")"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Check release signing secrets
+        if: steps.plan.outputs.enabled == 'true'
         env:
           KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
           STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
@@ -395,17 +701,23 @@ jobs:
             echo "Android signing secrets are not configured: set ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, and ANDROID_KEY_PASSWORD on the android-release environment." >&2
             exit 1
           fi
+
       - name: Download the unsigned APK
+        if: steps.plan.outputs.enabled == 'true'
         uses: actions/download-artifact@v4
         with:
           name: phantom-android-unsigned
           path: ${{ runner.temp }}/unsigned
+
       - name: Set up JDK for apksigner
+        if: steps.plan.outputs.enabled == 'true'
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "21"
+
       - name: Locate the Android SDK signing tools
+        if: steps.plan.outputs.enabled == 'true'
         run: |
           set -euo pipefail
           SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
@@ -430,9 +742,14 @@ jobs:
             echo "ZIPALIGN=$ZIPALIGN"
           } >> "$GITHUB_ENV"
           echo "Using $APKSIGNER"
+
       - name: Sign, verify, and upload the Android APK
+        if: steps.plan.outputs.enabled == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.plan.outputs.version }}
+          VERSION_TAG: ${{ steps.plan.outputs.tag }}
+          ROLLING_TAG: ${{ steps.plan.outputs.rolling_tag }}
           KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
           STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
@@ -457,7 +774,7 @@ jobs:
             exit 1
           fi
 
-          OUT="$RUNNER_TEMP/Phantom-Android.apk"
+          OUT="$RUNNER_TEMP/Phantom-Android-${VERSION}.apk"
           # Passwords are read from the environment so they never appear in a command line.
           if ! "$APKSIGNER" sign \
               --ks "$KEYSTORE" \
@@ -478,110 +795,399 @@ jobs:
           gh release upload "$VERSION_TAG" "$OUT" --clobber --repo "$GITHUB_REPOSITORY"
           gh release upload "$ROLLING_TAG" "$OUT" --clobber --repo "$GITHUB_REPOSITORY"
 
+  # ---------------------------------------------------------------------------------------------
+  # Publish: one writer per channel. Rewrites latest.json so each platform keeps its own pointer,
+  # so a failed or skipped platform keeps serving its previous good build instead of blocking the
+  # rest of the release. Runs even when a build failed; re-runs are idempotent because the plan
+  # (and therefore the tag) is pinned.
+  # ---------------------------------------------------------------------------------------------
   publish:
-    needs: [version, prepare-release, windows, macos, android-sign]
-    # A skipped platform is a normal outcome now, so the default "all needs succeeded" rule
-    # would skip publishing whenever a checkbox is cleared. Run when nothing failed instead.
-    if: ${{ always() && needs.version.result == 'success' && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
+    name: Publish
+    needs: [version, windows, macos, android-build, android-sign]
+    # A failed platform is an expected outcome to publish around, so do not inherit the default
+    # "all needs succeeded" rule. version failing means there is no plan to publish and a re-run
+    # of only the failed jobs is not possible anyway.
+    if: ${{ !cancelled() && needs.version.result != 'failure' }}
     runs-on: ubuntu-latest
-    env:
-      VERSION: ${{ needs.version.outputs.version }}
-      VERSION_TAG: ${{ needs.version.outputs.tag }}
-      SOURCE_REF: ${{ needs.version.outputs.source_ref }}
-      SOURCE_SHA: ${{ needs.version.outputs.source_sha }}
-      BUILD_WINDOWS: ${{ needs.version.outputs.build_windows }}
-      BUILD_MACOS: ${{ needs.version.outputs.build_macos }}
-      BUILD_ANDROID: ${{ needs.version.outputs.build_android }}
     steps:
-      - name: Publish latest.json and stamp release notes
+      - name: Download the release plan
+        uses: actions/download-artifact@v4
+        with:
+          name: release-plan
+          path: ${{ runner.temp }}/release-plan
+
+      - name: Update download pointers and publish latest.json
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PLAN_FILE: ${{ runner.temp }}/release-plan/release-plan.json
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          import json, os
-          payload = {
-            "version": os.environ["VERSION"],
-            "tag": os.environ["VERSION_TAG"],
-            "ref": os.environ["SOURCE_REF"],
-            "sha": os.environ["SOURCE_SHA"],
-            "runNumber": int(os.environ["GITHUB_RUN_NUMBER"]),
+          PLAN="$PLAN_FILE"
+          if [ ! -f "$PLAN" ]; then
+            echo "The release plan artifact is missing; the version job did not finish." >&2
+            exit 1
+          fi
+          WORK="$(mktemp -d)"
+          VERSION="$(jq -r .version "$PLAN")"
+          TAG="$(jq -r .tag "$PLAN")"
+          ROLLING_TAG="$(jq -r .rollingTag "$PLAN")"
+          CHANNEL="$(jq -r .channel "$PLAN")"
+
+          EXISTING_MANIFEST=""
+          mkdir -p "$WORK/existing"
+          # Missing latest.json on a brand-new channel is normal; any other failure is not.
+          if gh release download "$ROLLING_TAG" --repo "$GITHUB_REPOSITORY" --pattern latest.json --dir "$WORK/existing" >/dev/null 2>&1; then
+            EXISTING_MANIFEST="$WORK/existing/latest.json"
+          else
+            echo "No previous latest.json on $ROLLING_TAG (first release on this channel)."
+          fi
+
+          if ! RELEASE_ASSETS="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '[.assets[].name]')"; then
+            echo "Could not read the assets of $TAG. Verify the tag exists and the token can read releases." >&2
+            exit 1
+          fi
+
+          export VERSION TAG ROLLING_TAG CHANNEL EXISTING_MANIFEST RELEASE_ASSETS
+          export RUN_ID="$(jq -r .runId "$PLAN")"
+          export VERSION_CODE="$(jq -r .versionCode "$PLAN")"
+          export SOURCE_REF="$(jq -r .sourceRef "$PLAN")"
+          export SOURCE_SHA="$(jq -r .sourceSha "$PLAN")"
+          export PLATFORMS="$(jq -r '.platforms | join(",")' "$PLAN")"
+          export MANIFEST_OUT="$WORK/latest.json"
+          export NOTES_VERSION_OUT="$WORK/notes-version.md"
+          export NOTES_ROLLING_OUT="$WORK/notes-rolling.md"
+          export KEEP_OUT="$WORK/keep.txt"
+          export RESULT_OUT="$WORK/result.json"
+
+          python3 <<'PY'
+          import datetime
+          import json
+          import os
+
+
+          def need(name):
+              value = os.environ.get(name, "").strip()
+              if not value:
+                  raise SystemExit(f"{name} is empty")
+              return value
+
+
+          channel = need("CHANNEL")
+          version = need("VERSION")
+          tag = need("TAG")
+          source_ref = os.environ.get("SOURCE_REF", "")
+          source_sha = os.environ.get("SOURCE_SHA", "")
+          run_id = int(need("RUN_ID"))
+          version_code = int(need("VERSION_CODE"))
+          selected = [p for p in os.environ.get("PLATFORMS", "").split(",") if p]
+          release_assets = set(json.loads(os.environ.get("RELEASE_ASSETS", "[]")))
+          existing_path = os.environ.get("EXISTING_MANIFEST", "")
+
+          ASSET_NAMES = {
+              "windows": f"Phantom-Windows-x64-{version}.zip",
+              "macos": f"Phantom-macOS-{version}.zip",
+              "android": f"Phantom-Android-{version}.apk",
           }
-          open("latest.json", "w", encoding="utf-8").write(json.dumps(payload) + "\n")
+          LEGACY_NAMES = {
+              "windows": "Phantom-Windows-x64.zip",
+              "macos": "Phantom-macOS.zip",
+              "android": "Phantom-Android.apk",
+          }
+
+
+          def semver(text):
+              base = (text or "").split("-", 1)[0].split("+", 1)[0]
+              numbers = [int(part) for part in base.split(".") if part.isdigit()]
+              while len(numbers) < 3:
+                  numbers.append(0)
+              return tuple(numbers[:3])
+
+
+          previous = {}
+          if existing_path and os.path.exists(existing_path):
+              try:
+                  with open(existing_path, encoding="utf-8") as handle:
+                      previous = json.load(handle)
+              except (OSError, json.JSONDecodeError):
+                  previous = {}
+          previous_platforms = previous.get("platforms") or {}
+
+          now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+          # Each platform moves independently: only a build that produced this version's asset
+          # advances that platform's pointer. Everything else keeps serving its previous build.
+          platforms = {}
+          published = []
+          missing = []
+          carried = []
+
+          for name in ("windows", "macos", "android"):
+              pointer = previous_platforms.get(name)
+              asset = ASSET_NAMES[name]
+              present = asset in release_assets
+              selected_here = name in selected
+
+              if selected_here and present:
+                  pointer_version = (pointer or {}).get("version", "")
+                  if pointer is not None and semver(version) < semver(pointer_version):
+                      # A late re-run of an older release must not roll this platform back.
+                      platforms[name] = pointer
+                      carried.append(name)
+                  else:
+                      platforms[name] = {
+                          "version": version,
+                          "tag": tag,
+                          "asset": asset,
+                          "ref": source_ref,
+                          "sha": source_sha,
+                          "runId": run_id,
+                          "publishedAt": now,
+                      }
+                      published.append(name)
+              elif pointer is not None:
+                  platforms[name] = pointer
+                  if not selected_here:
+                      carried.append(name)
+
+              if selected_here and not present:
+                  missing.append(name)
+
+          # The channel's headline version only advances when this run actually published
+          # something. A run where every selected build failed creates an empty release but must
+          # not advertise a version that has no downloadable assets.
+          top_version = previous.get("version") or ""
+          if published and (not top_version or semver(version) > semver(top_version)):
+              top = {
+                  "version": version,
+                  "tag": tag,
+                  "ref": source_ref,
+                  "sha": source_sha,
+                  "runNumber": run_id,
+                  "versionCode": version_code,
+              }
+          else:
+              top = {
+                  "version": top_version or version,
+                  "tag": previous.get("tag") or tag,
+                  "ref": previous.get("ref") or source_ref,
+                  "sha": previous.get("sha") or source_sha,
+                  "runNumber": previous.get("runNumber") or run_id,
+                  "versionCode": previous.get("versionCode") or version_code,
+              }
+
+          manifest = {
+              "channel": channel,
+              "version": top["version"],
+              "tag": top["tag"],
+              "ref": top["ref"],
+              "sha": top["sha"],
+              "runNumber": top["runNumber"],
+              "versionCode": top["versionCode"],
+              "publishedAt": now,
+              "platforms": platforms,
+              "lastRun": {
+                  "runId": run_id,
+                  "version": version,
+                  "tag": tag,
+                  "published": published,
+                  "missing": missing,
+                  "keptPrevious": carried,
+              },
+          }
+
+
+          def pointer_line(name):
+              pointer = platforms.get(name)
+              if not pointer:
+                  return f"- {name}: not published yet"
+              return f"- {name}: {pointer['version']} ({pointer['asset']})"
+
+
+          version_lines = [
+              f"Phantom Desktop {version} (unsigned) from {source_ref} ({source_sha}).",
+              "",
+              f"channel: {channel}",
+              f"version: {version}",
+              f"run: {run_id}",
+              f"ref: {source_ref}",
+              f"sha: {source_sha}",
+              f"platforms: {','.join(selected) or 'none'}",
+              "",
+              f"published in this run: {', '.join(published) or 'none'}",
+          ]
+          if missing:
+              version_lines.append(f"missing from this run: {', '.join(missing)} (their pointers keep the previous build)")
+          if carried:
+              version_lines.append(f"not selected in this run: {', '.join(carried)} (pointers unchanged)")
+          version_lines += ["", "Current download pointers:"] + [pointer_line(name) for name in ("windows", "macos", "android")]
+
+          rolling_lines = [
+              f"Phantom Desktop - {channel} channel",
+              "",
+              "Download the file for your platform, or read latest.json for the machine-readable pointers.",
+              "",
+          ] + [pointer_line(name) for name in ("windows", "macos", "android")] + [
+              "",
+              f"Last update: {now} (run {run_id}, version {version}).",
+          ]
+
+          keep = ["latest.json"]
+          for pointer in platforms.values():
+              if pointer and pointer.get("asset"):
+                  keep.append(pointer["asset"])
+          for name in ("windows", "macos", "android"):
+              if name not in platforms:
+                  # Transitional: until every platform has a versioned pointer, the rolling
+                  # release keeps the old unversioned names so download links cannot 404.
+                  keep.append(LEGACY_NAMES[name])
+
+          result = {
+              "version": top["version"],
+              "tag": top["tag"],
+              "published": published,
+              "missing": missing,
+              "carried": carried,
+              "platforms": {name: (pointer or {}).get("version", "") for name, pointer in platforms.items()},
+          }
+
+          def write(path, text):
+              with open(path, "w", encoding="utf-8", newline="\n") as handle:
+                  handle.write(text)
+
+
+          write(os.environ["MANIFEST_OUT"], json.dumps(manifest, indent=2) + "\n")
+          write(os.environ["NOTES_VERSION_OUT"], "\n".join(version_lines) + "\n")
+          write(os.environ["NOTES_ROLLING_OUT"], "\n".join(rolling_lines) + "\n")
+          write(os.environ["KEEP_OUT"], "\n".join(keep) + "\n")
+          write(os.environ["RESULT_OUT"], json.dumps(result) + "\n")
           PY
-          NOTES="Phantom Desktop $VERSION (unsigned) from $SOURCE_REF ($SOURCE_SHA)."
-          gh release upload "$ROLLING_TAG" latest.json --clobber --repo "$GITHUB_REPOSITORY"
-          gh release edit "$ROLLING_TAG" --notes "$NOTES" --repo "$GITHUB_REPOSITORY"
-          gh release edit "$VERSION_TAG" --notes "$NOTES" --repo "$GITHUB_REPOSITORY"
-      - name: Assert releases expose only compiled build outputs
+
+          gh release upload "$ROLLING_TAG" "$WORK/latest.json" --clobber --repo "$GITHUB_REPOSITORY"
+          gh release edit "$TAG" --notes-file "$WORK/notes-version.md" --repo "$GITHUB_REPOSITORY"
+          gh release edit "$ROLLING_TAG" --notes-file "$WORK/notes-rolling.md" --repo "$GITHUB_REPOSITORY"
+
+          # The rolling release is a download surface, not a history: keep only the assets that
+          # a current pointer references (plus these transitional legacy names).
+          while IFS= read -r asset; do
+            [ -n "$asset" ] || continue
+            if grep -Fxq "$asset" "$WORK/keep.txt"; then
+              continue
+            fi
+            gh release delete-asset "$ROLLING_TAG" "$asset" --yes --repo "$GITHUB_REPOSITORY" >/dev/null
+            echo "Removed stale rolling asset $asset."
+          done < <(gh release view "$ROLLING_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
+
+          {
+            echo "### Desktop release $(jq -r .version "$WORK/result.json")"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Channel | $CHANNEL |"
+            echo "| Release | $VERSION ($TAG) |"
+            echo "| Rolling tag | $ROLLING_TAG |"
+            echo "| Published now | $(jq -r '.published | join(", ")' "$WORK/result.json") |"
+            echo "| Missing now | $(jq -r '.missing | join(", ")' "$WORK/result.json") |"
+            echo "| Pointers | $(jq -r '.platforms | to_entries | map("\(.key) \(.value // "none")") | join(", ")' "$WORK/result.json") |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          MISSING="$(jq -r '.missing | join(", ")' "$WORK/result.json")"
+          if [ -n "$MISSING" ]; then
+            echo "::warning::Not built in this run: ${MISSING}. Their download pointers still serve the previous build; re-run the failed job(s) to finish this release."
+          fi
+
+      - name: Assert releases expose only the current compiled outputs
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PLAN_FILE: ${{ runner.temp }}/release-plan/release-plan.json
         run: |
           set -euo pipefail
           # Tripwire, not prevention: every release asset is anonymously downloadable because this
           # repository is public, so if a future change ever attaches source or a stray file, fail
-          # the run loudly. Runs last because latest.json is uploaded by the step above.
-          # Only the assets for platforms selected in this run are required: the rolling tag keeps
-          # assets from earlier runs that built a platform this run skipped, because desktop-latest
-          # is a per-platform download pointer rather than a snapshot of a single run.
-          ASSET_WINDOWS="Phantom-Windows-x64.zip"
-          ASSET_MACOS="Phantom-macOS.zip"
-          ASSET_ANDROID="Phantom-Android.apk"
+          # the run loudly. The checks also prove that latest.json cannot point at a missing file.
+          PLAN="$PLAN_FILE"
+          VERSION="$(jq -r .version "$PLAN")"
+          TAG="$(jq -r .tag "$PLAN")"
+          ROLLING_TAG="$(jq -r .rollingTag "$PLAN")"
+          CHANNEL="$(jq -r .channel "$PLAN")"
+          SELECTED="$(jq -r '.platforms | join(",")' "$PLAN")"
 
-          REQUIRED=""
-          if [ "$BUILD_WINDOWS" = "true" ]; then REQUIRED="$REQUIRED $ASSET_WINDOWS"; fi
-          if [ "$BUILD_MACOS" = "true" ]; then REQUIRED="$REQUIRED $ASSET_MACOS"; fi
-          if [ "$BUILD_ANDROID" = "true" ]; then REQUIRED="$REQUIRED $ASSET_ANDROID"; fi
-          echo "Required assets for this run:${REQUIRED:- none}"
+          WORK="$(mktemp -d)"
+          if ! gh release download "$ROLLING_TAG" --repo "$GITHUB_REPOSITORY" --pattern latest.json --dir "$WORK"; then
+            echo "latest.json is missing from $ROLLING_TAG." >&2
+            exit 1
+          fi
 
-          release_assets() {
-            local tag="$1" assets
-            # Capture explicitly so a failed API call names itself instead of exiting silently
-            # through set -e and pipefail.
-            if ! assets="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
-                --json assets --jq '.assets[].name' | LC_ALL=C sort)"; then
-              echo "Could not read the asset list for $tag. Verify the tag exists and that the workflow token can read releases." >&2
-              return 1
+          ALLOWED_IMMUTABLE="$(printf '%s\n' \
+            "Phantom-Windows-x64-${VERSION}.zip" \
+            "Phantom-macOS-${VERSION}.zip" \
+            "Phantom-Android-${VERSION}.apk" | LC_ALL=C sort)"
+          if ! FOUND_IMMUTABLE="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | LC_ALL=C sort)"; then
+            echo "Could not read the asset list for $TAG." >&2
+            exit 1
+          fi
+
+          # 1. Every asset on the immutable release is a build output for this exact version.
+          while IFS= read -r name; do
+            [ -n "$name" ] || continue
+            if ! grep -Fxq "$name" <<< "$ALLOWED_IMMUTABLE"; then
+              echo "Unexpected asset '$name' on $TAG." >&2
+              exit 1
             fi
-            printf '%s\n' "$assets" | sed '/^[[:space:]]*$/d'
-          }
+          done <<< "$FOUND_IMMUTABLE"
 
-          check_release() {
-            local tag="$1" latest_allowed="$2" assets name
-            if ! assets="$(release_assets "$tag")"; then
-              return 1
+          # 2. Every pointer names a real file on a tag that belongs to this channel.
+          while IFS=$'\t' read -r platform pointer_tag pointer_asset; do
+            [ -n "$platform" ] || continue
+            case "$platform:$CHANNEL" in
+              *:staging) case "$pointer_tag" in *-staging) ;; *) echo "latest.json points $platform at $pointer_tag, which is not a staging tag." >&2; exit 1 ;; esac ;;
+              *:prod)    case "$pointer_tag" in *-staging) echo "latest.json points $platform at $pointer_tag, which is a staging tag." >&2; exit 1 ;; esac ;;
+            esac
+            if ! POINTER_ASSETS="$(gh release view "$pointer_tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"; then
+              echo "Could not read the asset list for $pointer_tag (pointer for $platform)." >&2
+              exit 1
             fi
-            # 1. Every asset must be a known compiled output (plus latest.json where allowed).
-            while IFS= read -r name; do
-              [ -n "$name" ] || continue
-              case "$name" in
-                "$ASSET_WINDOWS"|"$ASSET_MACOS"|"$ASSET_ANDROID") ;;
-                latest.json)
-                  if [ "$latest_allowed" != "true" ]; then
-                    echo "latest.json does not belong on $tag." >&2
-                    return 1
-                  fi
-                  ;;
-                *)
-                  echo "Unexpected asset '$name' on $tag." >&2
-                  return 1
-                  ;;
-              esac
-            done <<< "$assets"
-            # 2. Every platform this run built must be present.
-            for name in $REQUIRED; do
-              if ! grep -Fxq "$name" <<< "$assets"; then
-                echo "Missing $name on $tag." >&2
-                return 1
+            if ! grep -Fxq "$pointer_asset" <<< "$POINTER_ASSETS"; then
+              echo "latest.json points $platform at $pointer_tag, which has no $pointer_asset." >&2
+              exit 1
+            fi
+          done < <(jq -r '.platforms // {} | to_entries[] | [.key, .value.tag, .value.asset] | @tsv' "$WORK/latest.json")
+
+          # 3. If a platform's asset exists for this version it must be the recorded pointer.
+          for platform in windows macos android; do
+            case ",$SELECTED," in *",$platform,"*) ;; *) continue ;; esac
+            case "$platform" in
+              windows) asset="Phantom-Windows-x64-${VERSION}.zip" ;;
+              macos) asset="Phantom-macOS-${VERSION}.zip" ;;
+              android) asset="Phantom-Android-${VERSION}.apk" ;;
+            esac
+            if grep -Fxq "$asset" <<< "$FOUND_IMMUTABLE"; then
+              RECORDED="$(jq -r --arg p "$platform" '.platforms[$p].version // ""' "$WORK/latest.json")"
+              if [ "$RECORDED" != "$VERSION" ]; then
+                echo "$platform was published as $VERSION but latest.json records '$RECORDED'." >&2
+                exit 1
               fi
-            done
-            if [ "$latest_allowed" = "true" ] && ! grep -Fxq "latest.json" <<< "$assets"; then
-              echo "Missing latest.json on $tag." >&2
-              return 1
             fi
-            echo "$tag exposes: $(printf '%s' "$assets" | tr '\n' ' ')"
-          }
+          done
 
-          check_release "$ROLLING_TAG" true
-          check_release "$VERSION_TAG" false
-          echo "Both releases expose only the compiled outputs for the selected platforms."
+          # 4. The rolling release may only hold latest.json and the files its pointers name.
+          KEEP="$(mktemp)"
+          echo "latest.json" >> "$KEEP"
+          jq -r '.platforms // {} | to_entries[] | .value.asset' "$WORK/latest.json" >> "$KEEP"
+          for platform in windows macos android; do
+            if [ "$(jq -r --arg p "$platform" '.platforms[$p] // empty' "$WORK/latest.json")" = "" ]; then
+              case "$platform" in
+                windows) echo "Phantom-Windows-x64.zip" >> "$KEEP" ;;
+                macos) echo "Phantom-macOS.zip" >> "$KEEP" ;;
+                android) echo "Phantom-Android.apk" >> "$KEEP" ;;
+              esac
+            fi
+          done
+          while IFS= read -r name; do
+            [ -n "$name" ] || continue
+            if ! grep -Fxq "$name" "$KEEP"; then
+              echo "Unexpected asset '$name' on $ROLLING_TAG." >&2
+              exit 1
+            fi
+          done <<< "$(gh release view "$ROLLING_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
+
+          echo "Both releases expose only the current compiled outputs ($CHANNEL channel, $VERSION)."
