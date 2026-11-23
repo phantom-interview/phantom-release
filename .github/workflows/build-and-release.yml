@@ -98,6 +98,9 @@ jobs:
     steps:
       - name: Look for a plan pinned by an earlier attempt of this run
         id: existing
+        # Only a re-run can have a pinned plan. Skipping the probe on the first attempt keeps an
+        # expected "artifact not found" out of the run log.
+        if: ${{ github.run_attempt > 1 }}
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
@@ -458,6 +461,18 @@ jobs:
           gh release upload $env:VERSION_TAG $zip --clobber --repo "$env:GITHUB_REPOSITORY"
           gh release upload $env:ROLLING_TAG $zip --clobber --repo "$env:GITHUB_REPOSITORY"
 
+      # The release is the download surface; this copy exists so the build is also visible on this
+      # run's Artifacts panel. Public-repo artifact storage is free and short-lived here.
+      - name: Attach the Windows zip to this run
+        if: steps.plan.outputs.enabled == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Phantom-Windows-x64-${{ steps.plan.outputs.version }}.zip
+          path: ${{ runner.temp }}/Phantom-Windows-x64-${{ steps.plan.outputs.version }}.zip
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true
+
   macos:
     name: macOS
     needs: [version]
@@ -516,6 +531,16 @@ jobs:
           ditto -c -k --sequesterRsrc --keepParent phantom-mac-app/dist/Phantom.app "$ZIP"
           gh release upload "$VERSION_TAG" "$ZIP" --clobber --repo "$GITHUB_REPOSITORY"
           gh release upload "$ROLLING_TAG" "$ZIP" --clobber --repo "$GITHUB_REPOSITORY"
+
+      - name: Attach the macOS zip to this run
+        if: steps.plan.outputs.enabled == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Phantom-macOS-${{ steps.plan.outputs.version }}.zip
+          path: ${{ runner.temp }}/Phantom-macOS-${{ steps.plan.outputs.version }}.zip
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true
 
   android-build:
     name: Android build
@@ -794,6 +819,16 @@ jobs:
           rm -f "$KEYSTORE" "$UNSIGNED"
           gh release upload "$VERSION_TAG" "$OUT" --clobber --repo "$GITHUB_REPOSITORY"
           gh release upload "$ROLLING_TAG" "$OUT" --clobber --repo "$GITHUB_REPOSITORY"
+
+      - name: Attach the signed APK to this run
+        if: steps.plan.outputs.enabled == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Phantom-Android-${{ steps.plan.outputs.version }}.apk
+          path: ${{ runner.temp }}/Phantom-Android-${{ steps.plan.outputs.version }}.apk
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true
 
   # ---------------------------------------------------------------------------------------------
   # Publish: one writer per channel. Rewrites latest.json so each platform keeps its own pointer,
@@ -1097,6 +1132,14 @@ jobs:
             echo "| Published now | $(jq -r '.published | join(", ")' "$WORK/result.json") |"
             echo "| Missing now | $(jq -r '.missing | join(", ")' "$WORK/result.json") |"
             echo "| Pointers | $(jq -r '.platforms | to_entries | map("\(.key) \(.value // "none")") | join(", ")' "$WORK/result.json") |"
+            echo ""
+            echo "### Download"
+            echo ""
+            echo "Release page: https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG"
+            while IFS=$'\t' read -r platform asset pointer_tag; do
+              [ -n "$platform" ] || continue
+              echo "- [$platform](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/download/${pointer_tag}/${asset})"
+            done < <(jq -r '.platforms // {} | to_entries[] | [.key, .value.asset, .value.tag] | @tsv' "$WORK/latest.json")
           } >> "$GITHUB_STEP_SUMMARY"
 
           MISSING="$(jq -r '.missing | join(", ")' "$WORK/result.json")"
