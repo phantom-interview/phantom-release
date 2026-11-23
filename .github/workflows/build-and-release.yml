@@ -1,4 +1,4 @@
-name: Build and release apps
+name: Build and release desktop apps
 
 # Runs in phantom-interview/phantom-release (public). The private source repo is checked out
 # read-only, built, and only compiled outputs are attached to releases. There are two channels:
@@ -849,6 +849,7 @@ jobs:
 
           export VERSION TAG ROLLING_TAG CHANNEL EXISTING_MANIFEST RELEASE_ASSETS
           export RUN_ID="$(jq -r .runId "$PLAN")"
+          export RUN_NUMBER="$(jq -r .runNumber "$PLAN")"
           export VERSION_CODE="$(jq -r .versionCode "$PLAN")"
           export SOURCE_REF="$(jq -r .sourceRef "$PLAN")"
           export SOURCE_SHA="$(jq -r .sourceSha "$PLAN")"
@@ -878,6 +879,9 @@ jobs:
           source_ref = os.environ.get("SOURCE_REF", "")
           source_sha = os.environ.get("SOURCE_SHA", "")
           run_id = int(need("RUN_ID"))
+          # GITHUB_RUN_ID is the workflow run id; GITHUB_RUN_NUMBER is the build counter the
+          # old manifest exposed as runNumber. Keep them separate.
+          run_number = int(need("RUN_NUMBER"))
           version_code = int(need("VERSION_CODE"))
           selected = [p for p in os.environ.get("PLATFORMS", "").split(",") if p]
           release_assets = set(json.loads(os.environ.get("RELEASE_ASSETS", "[]")))
@@ -954,24 +958,28 @@ jobs:
 
           # The channel's headline version only advances when this run actually published
           # something. A run where every selected build failed creates an empty release but must
-          # not advertise a version that has no downloadable assets.
+          # not advertise a version that has no downloadable assets. When this run owns the
+          # current version already (a re-run), its metadata is rewritten so the record stays
+          # self-consistent instead of inheriting an older run's numbers.
           top_version = previous.get("version") or ""
-          if published and (not top_version or semver(version) > semver(top_version)):
+          same_as_top = bool(top_version) and semver(version) == semver(top_version)
+          advance = bool(published) and (not top_version or semver(version) > semver(top_version))
+          if not top_version or same_as_top or advance:
               top = {
                   "version": version,
                   "tag": tag,
                   "ref": source_ref,
                   "sha": source_sha,
-                  "runNumber": run_id,
+                  "runNumber": run_number,
                   "versionCode": version_code,
               }
           else:
               top = {
-                  "version": top_version or version,
+                  "version": top_version,
                   "tag": previous.get("tag") or tag,
                   "ref": previous.get("ref") or source_ref,
                   "sha": previous.get("sha") or source_sha,
-                  "runNumber": previous.get("runNumber") or run_id,
+                  "runNumber": previous.get("runNumber") or run_number,
                   "versionCode": previous.get("versionCode") or version_code,
               }
 
@@ -987,6 +995,7 @@ jobs:
               "platforms": platforms,
               "lastRun": {
                   "runId": run_id,
+                  "runNumber": run_number,
                   "version": version,
                   "tag": tag,
                   "published": published,
